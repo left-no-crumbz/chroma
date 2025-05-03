@@ -1893,6 +1893,7 @@ dependencies = [
 name = "chroma-types"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chroma-config",
  "chroma-error",
  "proptest",
