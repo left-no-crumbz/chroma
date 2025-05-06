@@ -668,21 +668,34 @@ impl SqliteMetadataReader {
         }
 
         if let Some(whr) = &where_clause {
-            filter_limit_query
-                .left_join(
-                    EmbeddingMetadata::Table,
-                    Expr::col((Embeddings::Table, Embeddings::Id))
-                        .equals((EmbeddingMetadata::Table, EmbeddingMetadata::Id)),
-                )
-                .left_join(
+            match whr {
+                Where::Composite(_) => filter_limit_query
+                    .left_join(
+                        EmbeddingMetadata::Table,
+                        Expr::col((Embeddings::Table, Embeddings::Id))
+                            .equals((EmbeddingMetadata::Table, EmbeddingMetadata::Id)),
+                    )
+                    .left_join(
+                        EmbeddingFulltextSearch::Table,
+                        Expr::col((Embeddings::Table, Embeddings::Id)).equals((
+                            EmbeddingFulltextSearch::Table,
+                            EmbeddingFulltextSearch::Rowid,
+                        )),
+                    ),
+                Where::Document(_) => filter_limit_query.left_join(
                     EmbeddingFulltextSearch::Table,
                     Expr::col((Embeddings::Table, Embeddings::Id)).equals((
                         EmbeddingFulltextSearch::Table,
                         EmbeddingFulltextSearch::Rowid,
                     )),
-                )
-                .distinct()
-                .cond_where(whr.eval());
+                ),
+                Where::Metadata(_) => filter_limit_query.left_join(
+                    EmbeddingMetadata::Table,
+                    Expr::col((Embeddings::Table, Embeddings::Id))
+                        .equals((EmbeddingMetadata::Table, EmbeddingMetadata::Id)),
+                ),
+            };
+            filter_limit_query.distinct().cond_where(whr.eval());
         }
 
         filter_limit_query
