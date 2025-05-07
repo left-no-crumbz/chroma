@@ -8,6 +8,8 @@ use chroma_types::{
 pub(crate) enum ToRecordsError {
     #[error("Inconsistent number of IDs, embeddings, documents, URIs and metadatas")]
     InconsistentLength,
+    #[error("Empty ID, ID must have at least one character")]
+    EmptyId,
 }
 
 impl ChromaError for ToRecordsError {
@@ -47,6 +49,9 @@ pub(crate) fn to_records<
     let mut records = Vec::with_capacity(len);
 
     for id in ids {
+        if id.is_empty() {
+            return Err(ToRecordsError::EmptyId);
+        }
         let embedding = embeddings_iter.next().flatten();
         let document = documents_iter.next().flatten();
         let uri = uris_iter.next().flatten();
@@ -86,4 +91,22 @@ pub(crate) fn to_records<
     }
 
     Ok((records, total_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use chroma_types::Operation;
+
+    use super::*;
+
+    #[test]
+    fn test_to_records_empty_id() {
+        let ids = vec![String::from("")];
+        let embeddings = vec![Some(vec![1.0, 2.0, 3.0])];
+        let result = super::to_records::<
+            chroma_types::UpdateMetadataValue,
+            Vec<(String, chroma_types::UpdateMetadataValue)>,
+        >(ids, Some(embeddings), None, None, None, Operation::Add);
+        assert!(matches!(result, Err(ToRecordsError::EmptyId)));
+    }
 }
