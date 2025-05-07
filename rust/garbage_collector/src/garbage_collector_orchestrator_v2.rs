@@ -9,6 +9,10 @@ use crate::operators::delete_unused_files::{
     DeleteUnusedFilesError, DeleteUnusedFilesInput, DeleteUnusedFilesOperator,
     DeleteUnusedFilesOutput,
 };
+use crate::operators::delete_versions_at_sysdb::{
+    DeleteVersionsAtSysDbError, DeleteVersionsAtSysDbInput, DeleteVersionsAtSysDbOperator,
+    DeleteVersionsAtSysDbOutput,
+};
 use crate::operators::list_files_at_version::{
     ListFilesAtVersionError, ListFilesAtVersionInput, ListFilesAtVersionOutput,
     ListFilesAtVersionsOperator,
@@ -23,7 +27,7 @@ use chroma_system::{
     wrap, ChannelError, ComponentContext, ComponentHandle, Dispatcher, Handler, Orchestrator,
     PanicError, System, TaskError, TaskMessage, TaskResult,
 };
-use chroma_types::chroma_proto::CollectionVersionFile;
+use chroma_types::chroma_proto::{CollectionVersionFile, VersionListForCollection};
 use chroma_types::CollectionUuid;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -43,15 +47,12 @@ pub struct GarbageCollectorOrchestrator {
     storage: Storage,
     root_manager: RootManager,
     result_channel: Option<Sender<Result<GarbageCollectorResponse, GarbageCollectorError>>>,
-    pending_version_file: Option<CollectionVersionFile>,
-    pending_versions_to_delete: Option<chroma_types::chroma_proto::VersionListForCollection>,
     pending_epoch_id: Option<i64>,
-    num_versions_deleted: u32,
-    deletion_list: Vec<String>,
     cleanup_mode: CleanupMode,
     version_files: HashMap<CollectionUuid, CollectionVersionFile>,
     versions_to_delete_output: Option<ComputeVersionsToDeleteOutput>,
     file_ref_counts: HashMap<String, u32>,
+    num_pending_tasks: usize,
 }
 
 impl Debug for GarbageCollectorOrchestrator {
@@ -60,13 +61,10 @@ impl Debug for GarbageCollectorOrchestrator {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct GarbageCollectorResponse {
-    pub collection_id: CollectionUuid,
-    pub version_file_path: String,
     pub num_versions_deleted: u32,
-    pub deletion_list: Vec<String>,
+    pub num_files_deleted: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -93,14 +91,11 @@ impl GarbageCollectorOrchestrator {
             root_manager,
             cleanup_mode,
             result_channel: None,
-            pending_version_file: None,
-            pending_versions_to_delete: None,
             pending_epoch_id: None,
-            num_versions_deleted: 0,
-            deletion_list: Vec::new(),
             version_files: HashMap::new(),
             file_ref_counts: HashMap::new(),
             versions_to_delete_output: None,
+            num_pending_tasks: 0,
         }
     }
 }
@@ -126,6 +121,8 @@ pub enum GarbageCollectorError {
     ListFilesAtVersion(#[from] ListFilesAtVersionError),
     #[error("Failed to delete unused files: {0}")]
     DeleteUnusedFiles(#[from] DeleteUnusedFilesError),
+    #[error("Failed to delete versions at sysdb: {0}")]
+    DeleteVersionsAtSysDb(#[from] DeleteVersionsAtSysDbError),
 }
 
 impl ChromaError for GarbageCollectorError {
@@ -413,5 +410,107 @@ impl Handler<TaskResult<DeleteUnusedFilesOutput, DeleteUnusedFilesError>>
             Some(output) => output,
             None => return,
         };
+
+        if self.cleanup_mode == CleanupMode::DryRun {
+            tracing::info!("Dry run mode, skipping actual deletion");
+            let response = GarbageCollectorResponse {
+                num_versions_deleted: 0,
+                num_files_deleted: 0,
+            };
+            self.terminate_with_result(Ok(response), ctx).await;
+            return;
+        }
+
+        // todo: was previously mutated?
+        let versions_to_delete = self.versions_to_delete_output.as_ref().unwrap();
+
+        self.num_pending_tasks += versions_to_delete.versions.len();
+
+        for (collection_id, versions) in &versions_to_delete.versions {
+            let versions_to_delete = versions
+                .iter()
+                .filter_map(|(version, action)| {
+                    if *action == CollectionVersionAction::Delete {
+                        Some(*version)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let version_file = self
+                .version_files
+                .get(&collection_id)
+                .expect("Version file should be present"); // todo
+
+            let delete_versions_task = wrap(
+                Box::new(DeleteVersionsAtSysDbOperator {
+                    storage: self.storage.clone(),
+                }),
+                DeleteVersionsAtSysDbInput {
+                    version_file: version_file.clone(),
+                    epoch_id: 0, // todo
+                    sysdb_client: self.sysdb_client.clone(),
+                    versions_to_delete: VersionListForCollection {
+                        tenant_id: version_file
+                            .collection_info_immutable
+                            .as_ref()
+                            .unwrap()
+                            .tenant_id
+                            .clone(), // todo
+                        database_id: version_file
+                            .collection_info_immutable
+                            .as_ref()
+                            .unwrap()
+                            .database_id
+                            .clone(), // todo
+                        collection_id: collection_id.to_string(),
+                        versions: versions_to_delete,
+                    },
+                    unused_s3_files: output.deleted_files.clone(),
+                },
+                ctx.receiver(),
+            );
+
+            if let Err(e) = self
+                .dispatcher()
+                .send(delete_versions_task, Some(Span::current()))
+                .await
+            {
+                self.terminate_with_result(Err(GarbageCollectorError::Channel(e)), ctx)
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Handler<TaskResult<DeleteVersionsAtSysDbOutput, DeleteVersionsAtSysDbError>>
+    for GarbageCollectorOrchestrator
+{
+    type Result = ();
+
+    async fn handle(
+        &mut self,
+        message: TaskResult<DeleteVersionsAtSysDbOutput, DeleteVersionsAtSysDbError>,
+        ctx: &ComponentContext<GarbageCollectorOrchestrator>,
+    ) {
+        // Stage 6: Final stage - versions deleted, complete the garbage collection process
+        let _output = match self.ok_or_terminate(message.into_inner(), ctx).await {
+            Some(output) => output,
+            None => return,
+        };
+
+        self.num_pending_tasks -= 1;
+        if self.num_pending_tasks == 0 {
+            let response = GarbageCollectorResponse {
+                // todo
+                num_files_deleted: 0,
+                num_versions_deleted: 0,
+            };
+
+            self.terminate_with_result(Ok(response), ctx).await;
+        }
     }
 }
