@@ -157,8 +157,6 @@ pub trait NgramLiteralProvider<E, const N: usize = 3> {
         }
 
         for literal in literals {
-            println!(">>>>>>>>>>>>>");
-            println!("SPD: {suffix_doc_pos:?}");
             if suffix_doc_pos.is_empty() {
                 break;
             }
